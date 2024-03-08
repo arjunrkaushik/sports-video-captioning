@@ -2,125 +2,107 @@ import argparse
 import csv
 import os
 from collections.abc import Callable
-from functools import partial
-from typing import Any
-
-import imageio.v3 as iio
+import json
 import numpy as np
+import pandas as pd
 import torch
 from pytorchvideo.transforms import UniformTemporalSubsample
+from pytorchvideo.data.clip_sampling import ClipInfo
+from pytorchvideo.data.video import VideoPathHandler
 from torch.utils.data import DataLoader
 from torchvision.transforms import Compose
 from tqdm import tqdm
 from transformers import Blip2Processor
+from video_blip.data.myUtils import generate_input_ids_and_labels_as_list
 
-from video_blip.data.ego4d import Ego4dFHOMainDataset
-from video_blip.data.myData import SoccerCaptioning
+# from video_blip.data.ego4d import Ego4dFHOMainDataset
+# from video_blip.data.myData import SoccerCaptioning
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--split_path", required=True)
-parser.add_argument("--video_dir", required=True)
-parser.add_argument("--frames_dir", required=True)
-parser.add_argument("--model_name_or_path", required=True)
-parser.add_argument("--num_subsample_frames", type=int, required=True)
-parser.add_argument("--num_workers", type=int, default=0)
-parser.add_argument("--max_num_narrated_actions", type=int, default=0)
-args = parser.parse_args()
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--split_path", required=True)
+# parser.add_argument("--video_dir", required=True)
+# parser.add_argument("--frames_dir", required=True)
+# parser.add_argument("--model_name_or_path", required=True)
+# parser.add_argument("--num_subsample_frames", type=int, required=True)
+# parser.add_argument("--num_workers", type=int, default=0)
+# parser.add_argument("--max_num_narrated_actions", type=int, default=0)
+# args = parser.parse_args()
+PROMPT = "Question: Generate soccer commentary Answer:"
 
+def extractTimeInfo(time_str):
+    parts = time_str.split('-')
+    minutes, seconds = map(int, parts[1].split(':'))
+    total_seconds = minutes * 60 + seconds
 
-def process_narrated_action(
-    pixel_values: torch.Tensor, video_uid: str, clip_index: int
-) -> str:
-    frame_path = video_uid + "|" + str(clip_index)
+    return int(parts[0]), int(total_seconds)
 
-    # Create a dir for the extracted frames
-    frames_dir = os.path.join(args.frames_dir, frame_path)
-    os.makedirs(frames_dir, exist_ok=True)
-
-    for i, frame in enumerate(
-        pixel_values.permute(1, 2, 3, 0).numpy().astype(np.uint8)
-    ):
-        iio.imwrite(
-            os.path.join(frames_dir, frame_path + "|" + str(i) + ".png"),
-            frame,
-            extension=".png",
+def extractFrames(csv_path, clipTime, video1, video2, video_transform, json_path):
+    infoDict = {}
+    csv = pd.read_csv(csv_path)
+    
+    for index, row in csv.iterrows():
+        print(f"Extracting {row['gameTime']} ")
+        decoder_only_lm = False
+        cleaned_text = row['anonymized'].strip()
+        preprocessed = generate_input_ids_and_labels_as_list(
+            processor.tokenizer, PROMPT, cleaned_text, decoder_only_lm
         )
-    return frame_path
+        half, timeStamp = extractTimeInfo(row['gameTime'])
+        if half == 1:
+            if timeStamp > video1.duration:
+                clip = video1.get_clip(video1.duration - clipTime, video1.duration)
+            elif timeStamp - clipTime < 0:
+                clip = video1.get_clip(0, clipTime)
+            else:
+                clip = video1.get_clip(timeStamp - clipTime, timeStamp)
+        elif half == 2:
+            if timeStamp > video2.duration:
+                clip = video2.get_clip(video2.duration - clipTime, video2.duration)
+            elif timeStamp - clipTime < 0:
+                clip = video2.get_clip(0, clipTime)
+            else:
+                clip = video2.get_clip(timeStamp - clipTime, timeStamp)
+        else:
+            print(f"Half = {half} unknown. Defaulting to last 30s of 2nd Half")
+            clip = video2.get_clip(video2.duration - clipTime, video2.duration)
 
+        pixel_values = clip["video"]
+        if video_transform is not None:
+            # preprocessed["pixel_values"] = video_transform(preprocessed["pixel_values"])
+            pixel_values = video_transform(pixel_values)
 
-processor = Blip2Processor.from_pretrained(args.model_name_or_path)
+            # run pixel_values through the image processor
+            pixel_values = processor.image_processor(
+                pixel_values.permute(1, 0, 2, 3), return_tensors="pt"
+            )["pixel_values"].permute(1, 0, 2, 3)
+        preprocessed["pixel_values"] = pixel_values.numpy().tolist()
+        # print("input ids type = ", type(preprocessed["input_ids"]))
+        # print("labels type = ", type(preprocessed["labels"]))
+        # print("pixels type = ", type(preprocessed["pixel_values"]))
+        infoDict[row['gameTime']] = preprocessed
 
+    with open(json_path, 'w') as file:
+        json.dump(infoDict, file)
 
-def transform(
-    processor: Blip2Processor,
-    video_transform: Callable[[torch.Tensor], torch.Tensor],
-    item: dict[str, Any],
-) -> dict[str, torch.Tensor]:
-    pixel_values = item.pop("video")
-    pixel_values = video_transform(pixel_values)
-
-    # run pixel_values through the image processor
-    pixel_values = processor.image_processor(
-        pixel_values.permute(1, 0, 2, 3), return_tensors="pt"
-    )["pixel_values"].permute(1, 0, 2, 3)
-
-    return {"pixel_values": pixel_values, **item}
-
-
-dataset = Ego4dFHOMainDataset(
-    args.fho_main_path,
-    args.split_path,
-    args.video_dir,
-    transform=partial(
-        transform,
-        processor,
-        Compose([UniformTemporalSubsample(args.num_subsample_frames)]),
-    ),
-    random_clip=False,
-)
-
-# Create a directory to save all the results
-os.makedirs(args.frames_dir, exist_ok=True)
-
-# Open narrated_actions.csv file for writing
-with open(
-    os.path.join(args.frames_dir, "narrated_actions.csv"), "w", newline=""
-) as csvfile:
-    # Initialize CSV writer
-    csv_writer = csv.DictWriter(
-        csvfile,
-        [
-            "frame_path",
-            "video_uid",
-            "clip_index",
-            "narration_timestamp_sec",
-            "narration_text",
-        ],
+if __name__ == '__main__':
+    clipTime = 15
+    num_subsample_frames = 15
+    video_dir = '/home/csgrad/kaushik3/VideoBLIP/Data'
+    video_handler = VideoPathHandler()
+    video1 = video_handler.video_from_path(
+        os.path.join(video_dir, '1_224p.mkv')
     )
-
-    # Write header row
-    csv_writer.writeheader()
-
-    num_extracted_narrated_action = 0
-    for item in tqdm(
-        DataLoader(dataset, batch_size=None, num_workers=args.num_workers),
-        desc="Extracting frames",
-    ):
-        frame_path = process_narrated_action(
-            item["pixel_values"], item["video_uid"], item["clip_index"]
-        )
-        csv_writer.writerow(
-            {
-                "frame_path": frame_path,
-                "video_uid": item["video_uid"],
-                "clip_index": item["clip_index"],
-                "narration_timestamp_sec": item["narration_timestamp_sec"],
-                "narration_text": item["narration_text"].strip(),
-            }
-        )
-        num_extracted_narrated_action += 1
-        if (
-            args.max_num_narrated_actions > 0
-            and num_extracted_narrated_action == args.max_num_narrated_actions
-        ):
-            break
+    video2 = video_handler.video_from_path(
+        os.path.join(video_dir, '2_224p.mkv')
+    )
+    processor = Blip2Processor.from_pretrained(
+        "Salesforce/blip2-opt-2.7b"
+    )
+    video_transform = Compose([UniformTemporalSubsample(num_subsample_frames)])
+    train_json_path = "/data/kaushik3/DVC_Data/train_new.json"
+    test_json_path = "/data/kaushik3/DVC_Data/val_new.json"
+    print("Working on Train")
+    extractFrames(csv_path="/home/csgrad/kaushik3/VideoBLIP/Data/train.csv", clipTime=clipTime, video1=video1, video2=video2, video_transform=video_transform, json_path=train_json_path)
+    print("Working on Test")
+    extractFrames(csv_path="/home/csgrad/kaushik3/VideoBLIP/Data/val.csv", clipTime=clipTime, video1=video1, video2=video2, video_transform=video_transform, json_path=test_json_path)
+   

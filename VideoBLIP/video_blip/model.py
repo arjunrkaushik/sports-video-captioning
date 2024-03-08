@@ -124,7 +124,7 @@ class VideoBlipForConditionalGeneration(Blip2ForConditionalGeneration):
         # Blip2ForConditionalGeneration.__init__() so we can replace
         # self.vision_model
         super(Blip2ForConditionalGeneration, self).__init__(config)
-
+        # print(config)
         self.vision_model = VideoBlipVisionModel(config.vision_config)
 
         self.query_tokens = nn.Parameter(

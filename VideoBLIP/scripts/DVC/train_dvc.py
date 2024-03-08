@@ -8,8 +8,8 @@ import transformers
 from pytorchvideo.transforms import UniformTemporalSubsample
 from torchvision.transforms import Compose
 from transformers.deepspeed import is_deepspeed_zero3_enabled
-from video_blip.data.myData import SoccerCaptioningFrame
-from video_blip.data.utils import (
+from video_blip.data.myData import SoccerCaptioningEmbeddings
+from video_blip.data.myUtils import (
     DataCollatorForVideoSeq2Seq,
     generate_input_ids_and_labels,
 )
@@ -29,13 +29,22 @@ def preprocess(
     preprocessed = generate_input_ids_and_labels(
         processor.tokenizer, PROMPT, item["narration_text"], decoder_only_lm
     )
-    preprocessed["pixel_values"] = item["video"]
+    # preprocessed["pixel_values"] = item["video"]
+    pixel_values = item["video"]
+    
     if video_transform is not None:
-        preprocessed["pixel_values"] = video_transform(preprocessed["pixel_values"])
+        # preprocessed["pixel_values"] = video_transform(preprocessed["pixel_values"])
+        pixel_values = video_transform(pixel_values)
+
+        # run pixel_values through the image processor
+        pixel_values = processor.image_processor(
+            pixel_values.permute(1, 0, 2, 3), return_tensors="pt"
+        )["pixel_values"].permute(1, 0, 2, 3)
 
     # pixel_values = processor.image_processor(
     #     pixel_values.permute(1, 0, 2, 3), return_tensors="pt"
     # )["pixel_values"].permute(1, 0, 2, 3)
+    preprocessed["pixel_values"] = pixel_values
     return preprocessed
 
 
@@ -85,37 +94,20 @@ def train() -> None:
     # we need to enable input require grads since the vision model (the first layer) is
     # frozen.
     model.enable_input_require_grads()
-
-    train_data = SoccerCaptioningFrame(
+    print("Preparing training dataset")
+    train_data = SoccerCaptioningEmbeddings(
         data_args.train_narrated_actions_dir,
-        train=True,
-        video_dir='Data',
-        transform=partial(
-            preprocess,
-            processor,
-            decoder_only_lm=model.config.use_decoder_only_language_model,
-            video_transform=Compose(
-                [UniformTemporalSubsample(model_args.num_subsample_frames)]
-            ),
-        ),
+        train=True
     )
-    val_data = SoccerCaptioningFrame(
+    print("Preparing val dataset")
+    val_data = SoccerCaptioningEmbeddings(
         data_args.val_narrated_actions_dir,
-        train=False,
-        video_dir= 'Data',
-        transform=partial(
-            preprocess,
-            processor,
-            decoder_only_lm=model.config.use_decoder_only_language_model,
-            video_transform=Compose(
-                [UniformTemporalSubsample(model_args.num_subsample_frames)]
-            ),
-        ),
+        train=False
     )
 
     # Load the best model at the end so we can save it
     training_args.load_best_model_at_end = True
-
+    # model = model.to('cuda')
     trainer = transformers.Trainer(
         model=model,
         args=training_args,
@@ -123,8 +115,9 @@ def train() -> None:
         eval_dataset=val_data,
         data_collator=DataCollatorForVideoSeq2Seq(
             processor.tokenizer,
-            pad_to_multiple_of=8 if training_args.fp16 or training_args.bf16 else None,
+            pad_to_multiple_of = 100
         ),
+        # no_cuda=True
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     model.save_pretrained(training_args.output_dir)
